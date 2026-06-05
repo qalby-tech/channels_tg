@@ -47,6 +47,12 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Failed to set webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}")
 
+    # Cache the bot's @username once so /health doesn't hit the Telegram API on
+    # every probe.
+    me = await bot.get_me()
+    app.state.bot_username = f"@{me.username}" if me.username else None
+    logger.info(f"Bot is {app.state.bot_username}")
+
     yield
 
     # Leave pending updates so a replacement pod can pick them up on rollout.
@@ -72,7 +78,8 @@ class SendResponse(BaseModel):
 @app.get("/health")
 @app.get("/")
 async def root():
-    return {"message": "🤖 Qalby TG Channel is running"}
+    # 200 OK + the bot's @username (cached at startup).
+    return {"status": "ok", "bot": getattr(app.state, "bot_username", None)}
 
 
 @app.post("/send", response_model=SendResponse)

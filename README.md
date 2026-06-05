@@ -6,11 +6,15 @@ chat through the bot.
 
 ## Endpoints
 
-| Method | Path                  | Purpose                                                 |
-| ------ | --------------------- | ------------------------------------------------------- |
-| GET    | `/health`, `/`        | Liveness/readiness probe.                               |
-| POST   | `/send`               | Relay a text message to a chat (`{chat_id, text}`).     |
-| POST   | `/webhook/telegram`   | Receives updates from Telegram (registered on startup). |
+| Method | Path                  | Purpose                                                          |
+| ------ | --------------------- | --------------------------------------------------------------- |
+| GET    | `/health`, `/`        | Probe — returns `200 {"status":"ok","bot":"@yourbot"}`.         |
+| POST   | `/send`               | Relay a text message to a chat (`{chat_id, text}`).             |
+| POST   | `/webhook/telegram`   | Receives updates from Telegram (registered on startup).         |
+
+Send the bot **`/start`** in Telegram and it replies with your chat ID — paste
+that into `/send` (or the platform's Telegram card). A bot can't message you
+until you've started it (or it's been added to your group/channel).
 
 ### Sending a message
 
