@@ -31,21 +31,38 @@ class EndpointFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 
-WEBHOOK_URL = settings.tg.webhook_url.rstrip("/") + settings.tg.webhook_endpoint
+WEBHOOK_URL = (
+    settings.tg.webhook_url.rstrip("/") + settings.tg.webhook_endpoint
+    if settings.tg.webhook_url
+    else None
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    is_success = await bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=dp.resolve_used_update_types(),
-        drop_pending_updates=settings.tg.drop_pending_updates,
-        secret_token=settings.tg.webhook_secret_token,
-    )
-    if not is_success:
-        logger.error(f"Failed to set webhook to {WEBHOOK_URL}")
-        raise RuntimeError("Failed to set webhook")
-    logger.info(f"Webhook set to {WEBHOOK_URL}")
+    polling_task: asyncio.Task | None = None
+
+    if settings.tg.mode == "polling":
+        # getUpdates can't run while a webhook is registered — clear it first
+        # (keeping pending updates so the queued ones still get delivered).
+        await bot.delete_webhook(drop_pending_updates=settings.tg.drop_pending_updates)
+        # Pull updates outbound (through the proxy). handle_signals=False —
+        # uvicorn owns the process signals, not aiogram.
+        polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+        logger.info("Update mode: long-polling (getUpdates)")
+    else:
+        if not WEBHOOK_URL:
+            raise RuntimeError("TG__WEBHOOK_URL is required in webhook mode")
+        is_success = await bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=settings.tg.drop_pending_updates,
+            secret_token=settings.tg.webhook_secret_token,
+        )
+        if not is_success:
+            logger.error(f"Failed to set webhook to {WEBHOOK_URL}")
+            raise RuntimeError("Failed to set webhook")
+        logger.info(f"Update mode: webhook -> {WEBHOOK_URL}")
 
     # Cache the bot's @username once so /health doesn't hit the Telegram API on
     # every probe.
@@ -55,8 +72,15 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Leave pending updates so a replacement pod can pick them up on rollout.
-    await bot.delete_webhook(drop_pending_updates=False)
+    if polling_task is not None:
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+    # In webhook mode we deliberately do NOT delete the webhook on shutdown:
+    # during a rolling update the replacement pod has already re-set it, and
+    # deleting here would race and leave the bot with no webhook.
     await bot.session.close()
 
 
