@@ -1,0 +1,13 @@
+# Build context excludes. check-changed.py also reads this file to decide
+# whether a push contains buildable changes — keep CI/docs out so a docs-only
+# or workflow-only push doesn't rebuild the image.
+.git
+.github
+.venv
+__pycache__
+*.py[oc]
+.python-version
+.env
+.dockerignore
+Dockerfile
+README.md

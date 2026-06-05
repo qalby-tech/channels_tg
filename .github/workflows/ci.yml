@@ -1,0 +1,147 @@
+# Build + push the channels-tg image, then update the channels/tg chart.
+#
+# Pipeline:
+#   build         — detect buildable change, parse the version from
+#                   pyproject.toml, build & push kamasalyamov/cloud_channels:tg-<version>
+#   update-chart  — (needs: build, only when build ran) set the chart's
+#                   appVersion to <version> (+ chart-version PATCH) in
+#                   qalby-tech/livellm_cloud_charts
+#
+# The project version in pyproject.toml is the single source of truth — bump
+# it by hand for a release. There is no VERSION file and CI never auto-commits
+# a version bump back to this repo.
+#
+# Buildability: any file changed since the LAST push (github.event.before .. HEAD)
+# that is NOT matched by .dockerignore. On first push to a brand-new branch
+# (github.event.before == 000…0), everything is treated as buildable.
+#
+# Secrets required on this repo:
+#   DOCKER_USERNAME   — Docker Hub username (kamasalyamov)
+#   DOCKER_PASSWORD   — Docker Hub access token (RW on cloud_channels)
+#   CHART_REPO_TOKEN  — PAT with `contents: write` on qalby-tech/livellm_cloud_charts
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build + push regardless of diff (uses current pyproject version)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      build:   ${{ steps.gate.outputs.build }}
+      version: ${{ steps.version.outputs.version }}
+      tag:     ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history; need it to diff against github.event.before
+
+      - name: Detect buildable change
+        id: detect
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base="${BEFORE:-HEAD~1}"
+          out=$(python3 .github/scripts/check-changed.py "$base" HEAD)
+          echo "build=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.force_build }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=${{ steps.detect.outputs.build }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Parse version from pyproject.toml
+        id: version
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -eu
+          v=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "pyproject version ($v) is not semver MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=$v"     >> "$GITHUB_OUTPUT"
+          echo "tag=tg-$v"      >> "$GITHUB_OUTPUT"
+          echo "channels_tg version $v -> image tag tg-$v"
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: |
+            kamasalyamov/cloud_channels:${{ steps.version.outputs.tag }}
+            kamasalyamov/cloud_channels:tg-latest
+          cache-from: type=registry,ref=kamasalyamov/cloud_channels:tg-buildcache
+          cache-to: type=registry,ref=kamasalyamov/cloud_channels:tg-buildcache,mode=max
+
+  update-chart:
+    needs: build
+    if: needs.build.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout channels_tg (for the bump-chart script)
+        uses: actions/checkout@v4
+        with:
+          path: channels-tg
+
+      - name: Checkout livellm_cloud_charts
+        uses: actions/checkout@v4
+        with:
+          repository: qalby-tech/livellm_cloud_charts
+          token: ${{ secrets.CHART_REPO_TOKEN }}
+          path: charts-repo
+
+      - name: Bump channels/tg chart appVersion/version
+        run: |
+          python3 channels-tg/.github/scripts/bump-chart.py \
+            charts-repo "${{ needs.build.outputs.version }}"
+
+      - name: Commit and push to livellm_cloud_charts
+        working-directory: charts-repo
+        run: |
+          if git diff --quiet; then
+            echo "chart already up to date"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add charts/channels/tg
+          git commit -m "channels/tg -> tg-${{ needs.build.outputs.version }} [skip ci]"
+          git push origin HEAD:main
